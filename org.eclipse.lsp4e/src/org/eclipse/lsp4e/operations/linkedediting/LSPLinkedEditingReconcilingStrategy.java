@@ -20,6 +20,9 @@ import java.util.Map.Entry;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import org.eclipse.core.runtime.ICoreRunnable;
 import org.eclipse.core.runtime.IProgressMonitor;
@@ -66,7 +69,7 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 
 	private boolean enabled;
 	private ISourceViewer sourceViewer;
-	private IDocument document;
+	private IDocument fDocument;
 	private EditorSelectionChangedListener editorSelectionChangedListener;
 	private CompletableFuture<?> request;
 	private Job highlightJob;
@@ -74,6 +77,7 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 	/**
 	 * Holds the current linkedEditing Ranges
 	 */
+//	static Map<IDocument, Set<LinkedEditingRanges>> fLinkedEditingRanges = new HashMap<>();
 	static Map<IDocument, LinkedEditingRanges> fLinkedEditingRanges = new HashMap<>();
 
 	/**
@@ -85,35 +89,38 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 	public LSPLinkedEditingReconcilingStrategy() {
 	}
 
-	private void collectLinkedEditingHighlights(int offset, IProgressMonitor monitor) {
-		if (sourceViewer == null || document == null || !enabled || monitor.isCanceled()) {
-			return;
+	private CompletableFuture<Void> collectLinkedEditingHighlights(int offset) {
+		if (sourceViewer == null || fDocument == null || !enabled) {
+			return CompletableFuture.completedFuture(null);
 		}
 		cancel();
+		fLinkedEditingRanges.put(fDocument, null);
 		Position position;
 		try {
-			position = LSPEclipseUtils.toPosition(offset, document);
+			position = LSPEclipseUtils.toPosition(offset, fDocument);
 		} catch (BadLocationException e) {
 			LanguageServerPlugin.logError(e);
-			return;
+			return CompletableFuture.completedFuture(null);
 		}
-		URI uri = LSPEclipseUtils.toUri(document);
+		URI uri = LSPEclipseUtils.toUri(fDocument);
 		if(uri == null) {
-			return;
+			return CompletableFuture.completedFuture(null);
 		}
+		long start = System.currentTimeMillis();
 		TextDocumentIdentifier identifier = new TextDocumentIdentifier(uri.toString());
 		TextDocumentPositionParams params = new TextDocumentPositionParams(identifier, position);
-		request = LanguageServiceAccessor.getLanguageServers(document,
+
+		return LanguageServiceAccessor.getLanguageServers(fDocument,
 					capabilities -> LSPEclipseUtils.hasCapability(capabilities.getLinkedEditingRangeProvider()))
-				.thenAcceptAsync(languageServers ->
-				CompletableFuture.allOf(languageServers.stream()
-						.map(ls -> ls.getTextDocumentService().linkedEditingRange(LSPEclipseUtils.toLinkedEditingRangeParams(params)))
-						.map(request -> request.thenAcceptAsync(result -> {
-							if (!monitor.isCanceled()) {
-								fLinkedEditingRanges.put(this.document, result);
-								updateLinkedEditingAnnotations(result, sourceViewer.getAnnotationModel());
-							}
-						})).toArray(CompletableFuture[]::new)));
+				.thenComposeAsync(languageServers ->
+					CompletableFuture.allOf(languageServers.stream()
+							.map(ls -> ls.getTextDocumentService().linkedEditingRange(LSPEclipseUtils.toLinkedEditingRangeParams(params))
+//							).map(request -> request
+									.thenAcceptAsync(result -> {
+								System.out.println(System.currentTimeMillis() + ": collectLinkedEditingHighlights: add a range"); //$NON-NLS-1$
+								fLinkedEditingRanges.put(fDocument, result);
+								}
+							)).toArray(CompletableFuture[]::new)));
 	}
 
 	class EditorSelectionChangedListener implements ISelectionChangedListener {
@@ -144,12 +151,7 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 
 		@Override
 		public void selectionChanged(SelectionChangedEvent event) {
-			ISelection selection = event.getSelection();
-			if (selection instanceof ITextSelection) {
-				System.out.println("selectionChanged(): " + ((ITextSelection)selection).getOffset()); //$NON-NLS-1$
-			} else {
-				System.out.println("selectionChanged(): NO initial selection or not an ITextSelection"); //$NON-NLS-1$
-			}
+			System.out.println(System.currentTimeMillis() + ": updateLinkedEditingHighlights: selectionChanged: " + (event.getSelection().toString())); //$NON-NLS-1$
 			updateLinkedEditingHighlights(event.getSelection());
 		}
 	}
@@ -199,12 +201,6 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 			if (textWidget != null && selectionProvider != null) {
 				textWidget.getDisplay().asyncExec(() -> {
 					if (!textWidget.isDisposed()) {
-						ISelection selection = selectionProvider.getSelection();
-						if (selection instanceof ITextSelection) {
-							System.out.println("initialReconcile: textSelection: " + ((ITextSelection)selection).getOffset()); //$NON-NLS-1$
-						} else {
-							System.out.println("initialReconcile: textSelection:  NO initial selection or not an ITextSelection"); //$NON-NLS-1$
-						}
 						updateLinkedEditingHighlights(selectionProvider.getSelection());
 					}
 				});
@@ -214,14 +210,14 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 
 	@Override
 	public void setDocument(IDocument document) {
-		if (this.document != null) {
-			this.document.removeDocumentListener(this);
+		if (this.fDocument != null) {
+			this.fDocument.removeDocumentListener(this);
 		}
 
-		this.document = document;
+		this.fDocument = document;
 
-		if (this.document != null) {
-			this.document.addDocumentListener(this);
+		if (this.fDocument != null) {
+			this.fDocument.addDocumentListener(this);
 		}
 	}
 
@@ -299,10 +295,24 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 
 	@Override
 	public void customizeDocumentCommand(IDocument document, DocumentCommand command) {
+		System.out.println(System.currentTimeMillis() + ": customizeDocumentCommand: >>>"); //$NON-NLS-1$
+
 		LinkedEditingRanges ranges = fLinkedEditingRanges.get(document);
 		if (ranges == null) {
+			try {
+				Thread.sleep(500);
+			} catch (InterruptedException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+			ranges = fLinkedEditingRanges.get(document);
+		}
+		if (ranges == null) {
+			System.out.println(System.currentTimeMillis() + ": customizeDocumentCommand: <<< Empty ranges!"); //$NON-NLS-1$
 			return;
 		}
+
+
 
 		Set<Range> sortedRanges = new TreeSet<>(RANGE_OFFSET_ORDER);
 		sortedRanges.addAll(ranges.getRanges());
@@ -332,8 +342,10 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 		}
 
 		if (commandRange == null) {
+			System.out.println(System.currentTimeMillis() + ": customizeDocumentCommand: Command is not inside ranges!"); //$NON-NLS-1$
 			return;
 		}
+
 
 		StringBuilder text = new StringBuilder();
 		int caretOffset = -1;
@@ -389,19 +401,35 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 		}
 	}
 
+	private void updateLinkedEditingHighlights(ISelection selection) {
+		if (selection instanceof ITextSelection) {
+			System.out.println(System.currentTimeMillis() + ": updateLinkedEditingHighlights: text selectionChanged: " + ((ITextSelection) selection).getOffset()); //$NON-NLS-1$
+
+			updateLinkedEditingHighlights(((ITextSelection) selection).getOffset());
+		}
+	}
+
 	private void updateLinkedEditingHighlights(int offset) {
+		try {
+			collectLinkedEditingHighlights(offset)
+			.get(500, TimeUnit.MILLISECONDS);
+//			.thenAcceptAsync(theVoid -> updateLinkedEditingHighlights());
+			updateLinkedEditingHighlights();
+		} catch (InterruptedException | ExecutionException | TimeoutException e) {
+			e.printStackTrace();
+		}
+	}
+
+	private void updateLinkedEditingHighlights() {
 		if (highlightJob != null) {
 			highlightJob.cancel();
 		}
 		highlightJob = Job.createSystem("LSP4E Linked Editing Highlight", //$NON-NLS-1$
-				(ICoreRunnable)(monitor -> collectLinkedEditingHighlights(offset, monitor)));
+				(ICoreRunnable)(monitor -> {
+					updateLinkedEditingAnnotations(
+							sourceViewer.getAnnotationModel(), monitor);
+					}));
 		highlightJob.schedule();
-	}
-
-	private void updateLinkedEditingHighlights(ISelection selection) {
-		if (selection instanceof ITextSelection) {
-			updateLinkedEditingHighlights(((ITextSelection) selection).getOffset());
-		}
 	}
 
 	/**
@@ -412,19 +440,29 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 	 * @param annotationModel
 	 *            annotation model to update.
 	 */
-	private void updateLinkedEditingAnnotations(LinkedEditingRanges linkedEditingRanges, IAnnotationModel annotationModel) {
-		Map<Annotation, org.eclipse.jface.text.Position> annotationMap = new HashMap<>(linkedEditingRanges.getRanges().size());
-		for (Range r : linkedEditingRanges.getRanges()) {
-			try {
-				int start = LSPEclipseUtils.toOffset(r.getStart(), document);
-				int end = LSPEclipseUtils.toOffset(r.getEnd(), document);
-				annotationMap.put(new Annotation(LINKEDEDITING_ANNOTATION_TYPE, false, null),
-						new org.eclipse.jface.text.Position(start, end - start));
-			} catch (BadLocationException e) {
-				LanguageServerPlugin.logError(e);
-			}
+	private void updateLinkedEditingAnnotations(IAnnotationModel annotationModel, IProgressMonitor monitor) {
+		System.out.println(System.currentTimeMillis() + ": updateLinkedEditingAnnotations: >>>"); //$NON-NLS-1$
+		LinkedEditingRanges ranges = fLinkedEditingRanges.get(fDocument);
+		if (monitor.isCanceled()) {
+			System.out.println(System.currentTimeMillis() + ": updateLinkedEditingAnnotations: <<< canceled or null ranges"); //$NON-NLS-1$
+			return;
 		}
 
+		Map<Annotation, org.eclipse.jface.text.Position> annotationMap = new HashMap<>(ranges == null ? 0 : ranges.getRanges().size());
+		if (ranges != null) {
+			for (Range r : ranges.getRanges()) {
+				try {
+					int start = LSPEclipseUtils.toOffset(r.getStart(), fDocument);
+					int end = LSPEclipseUtils.toOffset(r.getEnd(), fDocument);
+					annotationMap.put(new Annotation(LINKEDEDITING_ANNOTATION_TYPE, false, null),
+							new org.eclipse.jface.text.Position(start, end - start));
+				} catch (BadLocationException e) {
+					System.out.println(System.currentTimeMillis() + ": updateLinkedEditingAnnotations: BLE: " + e.getMessage()); //$NON-NLS-1$
+					e.printStackTrace();
+					LanguageServerPlugin.logError(e);
+				}
+			}
+		}
 		synchronized (getLockObject(annotationModel)) {
 			if (annotationModel instanceof IAnnotationModelExtension) {
 				((IAnnotationModelExtension) annotationModel).replaceAnnotations(fLinkedEditingAnnotations, annotationMap);
@@ -437,6 +475,7 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 				}
 			}
 			fLinkedEditingAnnotations = annotationMap.keySet().toArray(new Annotation[annotationMap.keySet().size()]);
+			System.out.println(System.currentTimeMillis() + ": updateLinkedEditingAnnotations: <<< OK"); //$NON-NLS-1$
 		}
 	}
 
@@ -457,7 +496,7 @@ public class LSPLinkedEditingReconcilingStrategy implements IReconcilingStrategy
 	}
 
 	void removeLinkedEditingAnnotations() {
-		fLinkedEditingRanges.put(this.document, null);
+//		fLinkedEditingRanges.put(this.document, null);
 		IAnnotationModel annotationModel = sourceViewer.getAnnotationModel();
 		if (annotationModel == null || fLinkedEditingAnnotations == null)
 			return;
